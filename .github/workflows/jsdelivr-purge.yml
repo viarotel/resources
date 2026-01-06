@@ -73,8 +73,8 @@ jobs:
             [ -n "$file" ] && echo "  - $file"
           done
           
-          # 将变更文件列表保存到临时文件（使用空字节分隔以支持空格）
-          echo "$CHANGED_FILES" | tr '\n' '\0' > /tmp/changed_files.txt
+          # 将变更文件列表保存到临时文件（使用换行分隔，后续逐行读取）
+          echo "$CHANGED_FILES" > /tmp/changed_files.txt
       
       # 步骤 3: 根据配置的扩展名过滤需要清理缓存的文件
       - name: Filter Target Files
@@ -83,11 +83,11 @@ jobs:
         run: |
           echo "🔧 根据配置的扩展名过滤文件..."
           
-          # 读取变更文件列表（空字节分隔）
-          TARGET_FILES=""
+          # 清空目标文件列表
+          > /tmp/target_files.txt
           
           # 使用 while IFS= read 正确处理包含空格的文件名
-          while IFS= read -r -d $'\0' file; do
+          while IFS= read -r file; do
             [ -z "$file" ] && continue
             
             # 获取文件名（basename）
@@ -101,19 +101,19 @@ jobs:
               
               # 检查扩展名是否在配置列表中
               if echo "$TARGET_EXTENSIONS" | grep -q -w "$ext_with_dot"; then
-                TARGET_FILES="${TARGET_FILES}${file}"$'\0'
+                echo "$file" >> /tmp/target_files.txt
               fi
             else
               # 无扩展名文件：根据配置决定是否清理
               if [ "$PURGE_NO_EXTENSION" = "true" ]; then
                 echo "  ℹ️  包含无扩展名文件: $file"
-                TARGET_FILES="${TARGET_FILES}${file}"$'\0'
+                echo "$file" >> /tmp/target_files.txt
               fi
             fi
           done < /tmp/changed_files.txt
           
-          # 检查是否有符合条件的文件
-          if [ -z "$TARGET_FILES" ]; then
+          # 检查是否有符合条件的文件（检查文件大小）
+          if [ ! -s /tmp/target_files.txt ]; then
             echo "⚠️  没有符合扩展名规则的文件，跳过缓存清理"
             echo "has_target_files=false" >> $GITHUB_OUTPUT
             exit 0
@@ -123,12 +123,9 @@ jobs:
           
           # 输出符合条件的文件列表
           echo "✅ 需要清理缓存的文件:"
-          echo -n "$TARGET_FILES" | while IFS= read -r -d $'\0' file; do
+          while IFS= read -r file; do
             [ -n "$file" ] && echo "  - $file"
-          done
-          
-          # 保存到临时文件（空字节分隔）
-          echo -n "$TARGET_FILES" > /tmp/target_files.txt
+          done < /tmp/target_files.txt
       
       # 步骤 4: 生成 jsDelivr CDN URLs
       - name: Generate CDN URLs
@@ -137,12 +134,22 @@ jobs:
         run: |
           echo "🌐 生成 jsDelivr CDN URLs..."
           
+          # 检查目标文件列表是否存在且不为空
+          if [ ! -s /tmp/target_files.txt ]; then
+            echo "❌ 目标文件列表为空"
+            echo "has_urls=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
           # 生成 CDN URLs（逗号分隔）
           CDN_URLS=""
+          file_count=0
           
           # 使用 while IFS= read 正确处理包含空格的文件名
-          while IFS= read -r -d $'\0' file; do
+          while IFS= read -r file; do
             [ -z "$file" ] && continue
+            
+            file_count=$((file_count + 1))
             
             # URL 编码文件路径（处理空格和特殊字符）
             # 将空格替换为 %20，其他特殊字符保持原样（jsDelivr 支持）
@@ -160,8 +167,9 @@ jobs:
           done < /tmp/target_files.txt
           
           # 检查是否成功生成 URLs
-          if [ -z "$CDN_URLS" ]; then
-            echo "❌ 未能生成有效的 CDN URLs"
+          echo "📊 处理了 $file_count 个文件"
+          if [ -z "$CDN_URLS" ] || [ $file_count -eq 0 ]; then
+            echo "❌ 未能生成有效的 CDN URLs（处理文件数: $file_count）"
             echo "has_urls=false" >> $GITHUB_OUTPUT
             exit 1
           fi
