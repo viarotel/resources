@@ -1,6 +1,7 @@
 name: Purge jsDelivr Cache
 
 # 工作流触发条件：当向主分支推送时自动执行
+# 策略：仅清理已修改的文件，跳过新增文件（新增文件无缓存，无需清理）
 on:
   push:
     branches:
@@ -10,9 +11,11 @@ on:
 # 环境变量配置区
 env:
   # 需要清理缓存的文件扩展名（使用空格分隔）
+  # 仅对这些扩展名的已修改文件执行缓存清理
   TARGET_EXTENSIONS: '.js .css .wasm .json .html .svg .png .jpg .jpeg .gif .webp .ico .woff .woff2 .ttf .eot'
   
   # 是否清理无扩展名文件的缓存（true/false）
+  # 建议设为 false，避免清理如 LICENSE、Makefile 等配置文件
   PURGE_NO_EXTENSION: 'false'
   
   # jsDelivr CDN 基础 URL 模板
@@ -43,32 +46,39 @@ jobs:
           
           # 处理首次推送场景（before 为全 0）
           if [[ "$BASE_SHA" =~ ^0+$ ]] || [ -z "$BASE_SHA" ]; then
-            echo "⚠️  检测到首次推送或无效的 before SHA，使用 HEAD~1 作为基准"
-            BASE_SHA="HEAD~1"
+            echo "⚠️  检测到首次推送，所有文件均为新增，跳过缓存清理"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
           fi
           
           # 验证 BASE_SHA 是否存在
           if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1; then
-            echo "⚠️  基准提交 $BASE_SHA 不存在，使用 HEAD 作为当前提交的变更"
-            # 对于首次提交或特殊情况，获取当前提交的所有文件
-            CHANGED_FILES=$(git ls-tree -r --name-only HEAD 2>/dev/null || echo "")
-          else
-            # 使用 git diff 获取变更文件列表（空字节分隔，支持空格文件名）
-            # --diff-filter=ACMR: 包括新增(A)、复制(C)、修改(M)、重命名(R)，排除删除(D)
-            CHANGED_FILES=$(git diff -z --name-only --diff-filter=ACMR "$BASE_SHA" "$CURRENT_SHA" 2>/dev/null | tr '\0' '\n' || echo "")
+            echo "⚠️  基准提交 $BASE_SHA 不存在，尝试使用 HEAD~1"
+            BASE_SHA="HEAD~1"
+            
+            # 再次验证
+            if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1; then
+              echo "⚠️  HEAD~1 也不存在，可能是首次提交，跳过缓存清理"
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
           fi
           
-          # 检查是否有变更文件
+          # 使用 git diff 获取**仅修改**的文件列表（排除新增文件）
+          # --diff-filter=M: 仅包含修改(Modified)的文件，排除新增(A)、复制(C)、重命名(R)、删除(D)
+          CHANGED_FILES=$(git diff --name-only --diff-filter=M "$BASE_SHA" "$CURRENT_SHA" 2>/dev/null || echo "")
+          
+          # 检查是否有修改的文件
           if [ -z "$CHANGED_FILES" ]; then
-            echo "⚠️  未检测到文件变更，跳过缓存清理"
+            echo "ℹ️  未检测到已修改的文件（新增文件不需要清理缓存）"
             echo "has_changes=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
           echo "has_changes=true" >> $GITHUB_OUTPUT
           
-          # 输出变更文件列表（用于调试）
-          echo "📝 变更文件列表 (对比 $BASE_SHA → $CURRENT_SHA):"
+          # 输出修改的文件列表（用于调试）
+          echo "📝 已修改的文件列表 (对比 $BASE_SHA → $CURRENT_SHA):"
           echo "$CHANGED_FILES" | while IFS= read -r file; do
             [ -n "$file" ] && echo "  - $file"
           done
@@ -199,11 +209,13 @@ jobs:
         run: |
           echo "## 🎯 jsDelivr 缓存清理执行摘要" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **策略**: 仅清理已修改的文件，跳过新增文件" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ steps.changed_files.outputs.has_changes }}" != "true" ]; then
-            echo "⚠️ **结果**: 未检测到文件变更" >> $GITHUB_STEP_SUMMARY
+            echo "ℹ️ **结果**: 未检测到已修改的文件（新增文件不需要清理缓存）" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.filter_files.outputs.has_target_files }}" != "true" ]; then
-            echo "⚠️ **结果**: 变更文件不符合扩展名规则" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **结果**: 已修改的文件不符合扩展名规则" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**配置的扩展名**: \`$TARGET_EXTENSIONS\`" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.generate_urls.outputs.has_urls }}" != "true" ]; then
