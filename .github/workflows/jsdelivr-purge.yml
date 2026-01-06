@@ -1,0 +1,210 @@
+name: Purge jsDelivr Cache
+
+# 工作流触发条件：当向主分支推送时自动执行
+on:
+  push:
+    branches:
+      - main
+      - master
+
+# 环境变量配置区
+env:
+  # 需要清理缓存的文件扩展名（使用空格分隔）
+  TARGET_EXTENSIONS: '.js .css .wasm .json .html .svg .png .jpg .jpeg .gif .webp .ico .woff .woff2 .ttf .eot'
+  
+  # 是否清理无扩展名文件的缓存（true/false）
+  PURGE_NO_EXTENSION: 'false'
+  
+  # jsDelivr CDN 基础 URL 模板
+  CDN_BASE_URL: 'https://cdn.jsdelivr.net/gh/${{ github.repository }}@latest'
+
+jobs:
+  purge-cache:
+    name: Purge Changed Files Cache
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 步骤 1: 检出代码仓库
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整 git 历史以支持可靠的差异对比
+      
+      # 步骤 2: 获取本次提交中变更的文件列表
+      - name: Get Changed Files
+        id: changed_files
+        run: |
+          echo "🔍 检测本次提交中的文件变更..."
+          
+          # 确定比较的基准提交
+          # 优先使用 github.event.before（push 前的 SHA），回退到 HEAD~1
+          BASE_SHA="${{ github.event.before }}"
+          CURRENT_SHA="${{ github.sha }}"
+          
+          # 处理首次推送场景（before 为全 0）
+          if [[ "$BASE_SHA" =~ ^0+$ ]] || [ -z "$BASE_SHA" ]; then
+            echo "⚠️  检测到首次推送或无效的 before SHA，使用 HEAD~1 作为基准"
+            BASE_SHA="HEAD~1"
+          fi
+          
+          # 验证 BASE_SHA 是否存在
+          if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1; then
+            echo "⚠️  基准提交 $BASE_SHA 不存在，使用 HEAD 作为当前提交的变更"
+            # 对于首次提交或特殊情况，获取当前提交的所有文件
+            CHANGED_FILES=$(git ls-tree -r --name-only HEAD 2>/dev/null || echo "")
+          else
+            # 使用 git diff 获取变更文件列表（空字节分隔，支持空格文件名）
+            # --diff-filter=ACMR: 包括新增(A)、复制(C)、修改(M)、重命名(R)，排除删除(D)
+            CHANGED_FILES=$(git diff -z --name-only --diff-filter=ACMR "$BASE_SHA" "$CURRENT_SHA" 2>/dev/null | tr '\0' '\n' || echo "")
+          fi
+          
+          # 检查是否有变更文件
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "⚠️  未检测到文件变更，跳过缓存清理"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          
+          # 输出变更文件列表（用于调试）
+          echo "📝 变更文件列表 (对比 $BASE_SHA → $CURRENT_SHA):"
+          echo "$CHANGED_FILES" | while IFS= read -r file; do
+            [ -n "$file" ] && echo "  - $file"
+          done
+          
+          # 将变更文件列表保存到临时文件（使用空字节分隔以支持空格）
+          echo "$CHANGED_FILES" | tr '\n' '\0' > /tmp/changed_files.txt
+      
+      # 步骤 3: 根据配置的扩展名过滤需要清理缓存的文件
+      - name: Filter Target Files
+        id: filter_files
+        if: steps.changed_files.outputs.has_changes == 'true'
+        run: |
+          echo "🔧 根据配置的扩展名过滤文件..."
+          
+          # 读取变更文件列表（空字节分隔）
+          TARGET_FILES=""
+          
+          # 使用 while IFS= read 正确处理包含空格的文件名
+          while IFS= read -r -d $'\0' file; do
+            [ -z "$file" ] && continue
+            
+            # 获取文件名（basename）
+            filename=$(basename "$file")
+            
+            # 检查文件是否包含扩展名（是否有点且点不在开头）
+            if [[ "$filename" == *.* ]] && [[ "$filename" != .* ]]; then
+              # 提取扩展名（转换为小写）
+              ext=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
+              ext_with_dot=".${ext}"
+              
+              # 检查扩展名是否在配置列表中
+              if echo "$TARGET_EXTENSIONS" | grep -q -w "$ext_with_dot"; then
+                TARGET_FILES="${TARGET_FILES}${file}"$'\0'
+              fi
+            else
+              # 无扩展名文件：根据配置决定是否清理
+              if [ "$PURGE_NO_EXTENSION" = "true" ]; then
+                echo "  ℹ️  包含无扩展名文件: $file"
+                TARGET_FILES="${TARGET_FILES}${file}"$'\0'
+              fi
+            fi
+          done < /tmp/changed_files.txt
+          
+          # 检查是否有符合条件的文件
+          if [ -z "$TARGET_FILES" ]; then
+            echo "⚠️  没有符合扩展名规则的文件，跳过缓存清理"
+            echo "has_target_files=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "has_target_files=true" >> $GITHUB_OUTPUT
+          
+          # 输出符合条件的文件列表
+          echo "✅ 需要清理缓存的文件:"
+          echo -n "$TARGET_FILES" | while IFS= read -r -d $'\0' file; do
+            [ -n "$file" ] && echo "  - $file"
+          done
+          
+          # 保存到临时文件（空字节分隔）
+          echo -n "$TARGET_FILES" > /tmp/target_files.txt
+      
+      # 步骤 4: 生成 jsDelivr CDN URLs
+      - name: Generate CDN URLs
+        id: generate_urls
+        if: steps.filter_files.outputs.has_target_files == 'true'
+        run: |
+          echo "🌐 生成 jsDelivr CDN URLs..."
+          
+          # 生成 CDN URLs（逗号分隔）
+          CDN_URLS=""
+          
+          # 使用 while IFS= read 正确处理包含空格的文件名
+          while IFS= read -r -d $'\0' file; do
+            [ -z "$file" ] && continue
+            
+            # URL 编码文件路径（处理空格和特殊字符）
+            # 将空格替换为 %20，其他特殊字符保持原样（jsDelivr 支持）
+            encoded_file=$(echo "$file" | sed 's/ /%20/g')
+            
+            # 构建完整的 CDN URL
+            url="${CDN_BASE_URL}/${encoded_file}"
+            
+            # 添加到 URL 列表（使用逗号分隔）
+            if [ -z "$CDN_URLS" ]; then
+              CDN_URLS="$url"
+            else
+              CDN_URLS="${CDN_URLS},${url}"
+            fi
+          done < /tmp/target_files.txt
+          
+          # 检查是否成功生成 URLs
+          if [ -z "$CDN_URLS" ]; then
+            echo "❌ 未能生成有效的 CDN URLs"
+            echo "has_urls=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "has_urls=true" >> $GITHUB_OUTPUT
+          
+          # 输出生成的 URLs（用于调试）
+          echo "📋 待清理的 CDN URLs:"
+          echo "$CDN_URLS" | tr ',' '\n' | while IFS= read -r url; do
+            [ -n "$url" ] && echo "  - $url"
+          done
+          
+          # 保存 URLs 到输出
+          echo "urls=$CDN_URLS" >> $GITHUB_OUTPUT
+      
+      # 步骤 5: 执行 jsDelivr 缓存清理
+      - name: Purge jsDelivr Cache
+        if: steps.generate_urls.outputs.has_urls == 'true'
+        uses: egad13/purge-jsdelivr-cache@v1
+        with:
+          url: ${{ steps.generate_urls.outputs.urls }}
+          attempts: 3  # 失败重试次数
+      
+      # 步骤 6: 输出执行结果摘要
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🎯 jsDelivr 缓存清理执行摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.changed_files.outputs.has_changes }}" != "true" ]; then
+            echo "⚠️ **结果**: 未检测到文件变更" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.filter_files.outputs.has_target_files }}" != "true" ]; then
+            echo "⚠️ **结果**: 变更文件不符合扩展名规则" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**配置的扩展名**: \`$TARGET_EXTENSIONS\`" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.generate_urls.outputs.has_urls }}" != "true" ]; then
+            echo "❌ **结果**: 未能生成有效的 CDN URLs" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **结果**: 缓存清理已完成" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**清理的 URLs**:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.generate_urls.outputs.urls }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
